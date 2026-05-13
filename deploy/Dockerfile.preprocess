@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1
+# One-shot preprocess: downloads references.json.gz and emits dataset.bin to /index.
+FROM rinha-zig-build AS preprocess
+WORKDIR /work
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+ADD https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz \
+    /data/references.json.gz
+RUN mkdir -p /index
+RUN /src/zig-out/bin/preprocess /data/references.json.gz /index/dataset.bin
+
+FROM scratch
+COPY --from=preprocess /index/dataset.bin /dataset.bin

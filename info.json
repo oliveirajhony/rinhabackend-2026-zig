@@ -1,0 +1,10 @@
+{
+    "participants": ["Jhony Oliveira"],
+    "social": [
+        "https://github.com/oliveirajhony",
+        "https://www.linkedin.com/in/oliveirajhony/"
+    ],
+    "source-code-repo": "https://github.com/oliveirajhony/rinhabackend-2026-zig",
+    "stack": ["zig", "io_uring"],
+    "open_to_work": true
+}

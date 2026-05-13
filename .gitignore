@@ -1,0 +1,22 @@
+# Build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Test history and local results
+test/history/
+test/results.json
+test/report.html
+test/k6.log
+# Massive (26MB) — baixe de https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/test/test-data.json
+test/test-data.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Internal notes (project-specific)
+README.md
