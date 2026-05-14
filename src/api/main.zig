@@ -5,6 +5,7 @@ const responses = @import("responses.zig");
 const parser = @import("parser.zig");
 const search = @import("search.zig");
 const warmup_mod = @import("warmup.zig");
+const fdpass = @import("fdpass.zig");
 const c = common.constants;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
@@ -14,11 +15,11 @@ pub const std_options: std.Options = .{
 };
 
 const MAX_REQUEST_BYTES: usize = 4096;
-const MAX_CONNS_PER_WORKER: usize = 512;
+const MAX_CONNS: usize = 1024;
 const RING_ENTRIES: u16 = 2048;
-const NUM_WORKERS: usize = 4;
+const FD_QUEUE_SIZE: usize = MAX_CONNS * 2;
 
-const Op = enum(u8) { accept = 0, read = 1, write = 2, close = 3 };
+const Op = enum(u8) { accept = 0, read = 1, write = 2, close = 3, eventfd_read = 4 };
 
 inline fn encodeUd(op: Op, idx: u32) u64 {
     return (@as(u64, @intFromEnum(op)) << 32) | @as(u64, idx);
@@ -37,15 +38,50 @@ const Conn = struct {
     buf: [MAX_REQUEST_BYTES]u8 = undefined,
 };
 
+/// SPSC queue: control thread pushes, worker thread pops. Spinlock simples
+/// porque os push/pop sao curtissimos.
+const FdQueue = struct {
+    lock_flag: std.atomic.Value(bool) = .init(false),
+    fds: [FD_QUEUE_SIZE]i32 = undefined,
+    len: usize = 0,
+
+    fn lock(self: *FdQueue) void {
+        while (self.lock_flag.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *FdQueue) void {
+        self.lock_flag.store(false, .release);
+    }
+
+    fn push(self: *FdQueue, fd: i32) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.len >= self.fds.len) return false;
+        self.fds[self.len] = fd;
+        self.len += 1;
+        return true;
+    }
+
+    fn drain(self: *FdQueue, out: []i32) usize {
+        self.lock();
+        defer self.unlock();
+        const n = @min(self.len, out.len);
+        @memcpy(out[0..n], self.fds[self.len - n .. self.len]);
+        self.len -= n;
+        return n;
+    }
+};
+
 const Worker = struct {
     ring: IoUring,
     listen_fd: i32,
+    event_fd: i32,
+    queue: *FdQueue,
     ds: *const common.index_format.Dataset,
     ws: search.Workspace,
-    conns: [MAX_CONNS_PER_WORKER]Conn = undefined,
-    free_stack: [MAX_CONNS_PER_WORKER]u32 = undefined,
-    free_top: usize = MAX_CONNS_PER_WORKER,
-    id: usize = 0,
+    conns: [MAX_CONNS]Conn = undefined,
+    free_stack: [MAX_CONNS]u32 = undefined,
+    free_top: usize = MAX_CONNS,
+    event_buf: [8]u8 = undefined,
 
     fn alloc(self: *Worker) ?u32 {
         if (self.free_top == 0) return null;
@@ -58,6 +94,12 @@ const Worker = struct {
         self.free_stack[self.free_top] = idx;
         self.free_top += 1;
     }
+};
+
+const ControlCtx = struct {
+    listen_fd: i32,
+    event_fd: i32,
+    queue: *FdQueue,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -94,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
     warmup_mod.warmup(&ds, &warm_ws);
     std.log.info("api: warmup ({d} iters) done", .{c.WARMUP_ITERS});
 
+    // Data socket (fallback / smoke test). LB com fd-pass nao usa.
     cwd.deleteFile(io, sock_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -106,42 +149,75 @@ pub fn main(init: std.process.Init) !void {
     const sock_z = try ally.dupeZ(u8, sock_path);
     if (std.c.chmod(sock_z.ptr, 0o666) != 0) std.log.warn("chmod failed on {s}", .{sock_path});
 
-    std.log.info("api: io_uring x{d} workers listening on {s}", .{ NUM_WORKERS, sock_path });
+    // Control socket: LB conecta uma vez, manda FDs via SCM_RIGHTS em loop.
+    const ctrl_path_z = try std.mem.concatWithSentinel(ally, u8, &.{ sock_path, ".ctrl" }, 0);
+    const ctrl_fd = try fdpass.openUnixListener(ctrl_path_z);
+    defer fdpass.closeFd(ctrl_fd);
+    if (std.c.chmod(ctrl_path_z.ptr, 0o666) != 0) std.log.warn("chmod failed on {s}", .{ctrl_path_z});
+    std.log.info("api: ctrl listener on {s}", .{ctrl_path_z});
+
+    // eventfd para a control thread acordar o worker io_uring.
+    const event_r = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(event_r) != .SUCCESS) return error.EventFdFailed;
+    const event_fd: i32 = @intCast(@as(isize, @bitCast(event_r)));
+    defer fdpass.closeFd(event_fd);
 
     const c_alloc = std.heap.c_allocator;
-    const workers = try c_alloc.alloc(Worker, NUM_WORKERS);
-    defer c_alloc.free(workers);
+    const queue = try c_alloc.create(FdQueue);
+    defer c_alloc.destroy(queue);
+    queue.* = FdQueue{};
 
-    for (workers, 0..) |*w, i| {
-        w.* = .{
-            .ring = try IoUring.init(RING_ENTRIES, 0),
-            .listen_fd = server.socket.handle,
-            .ds = &ds,
-            .ws = search.Workspace.init(),
-            .id = i,
-        };
-        for (&w.conns, 0..) |*conn, ci| {
-            conn.* = .{};
-            w.free_stack[MAX_CONNS_PER_WORKER - 1 - ci] = @intCast(ci);
+    const ctrl_ctx = try ally.create(ControlCtx);
+    ctrl_ctx.* = .{
+        .listen_fd = ctrl_fd,
+        .event_fd = event_fd,
+        .queue = queue,
+    };
+    const ctrl_thread = try std.Thread.spawn(.{}, controlThread, .{ctrl_ctx});
+    ctrl_thread.detach();
+
+    var worker = Worker{
+        .ring = try IoUring.init(RING_ENTRIES, 0),
+        .listen_fd = server.socket.handle,
+        .event_fd = event_fd,
+        .queue = queue,
+        .ds = &ds,
+        .ws = search.Workspace.init(),
+    };
+    for (&worker.conns, 0..) |*conn, ci| {
+        conn.* = .{};
+        worker.free_stack[MAX_CONNS - 1 - ci] = @intCast(ci);
+    }
+
+    workerMain(&worker);
+}
+
+fn controlThread(ctx: *ControlCtx) void {
+    while (true) {
+        const accept_r = linux.accept4(ctx.listen_fd, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(accept_r) != .SUCCESS) continue;
+        const conn_fd: i32 = @intCast(@as(isize, @bitCast(accept_r)));
+        defer fdpass.closeFd(conn_fd);
+
+        while (fdpass.recvFd(conn_fd)) |fd| {
+            if (ctx.queue.push(fd)) {
+                fdpass.notifyEvent(ctx.event_fd);
+            } else {
+                // Fila cheia: drop a conexao (degradacao graceful sob pico).
+                fdpass.closeFd(fd);
+            }
         }
     }
-
-    const threads = try c_alloc.alloc(std.Thread, NUM_WORKERS - 1);
-    defer c_alloc.free(threads);
-    for (threads, 1..) |*t, i| {
-        t.* = try std.Thread.spawn(.{}, workerMain, .{&workers[i]});
-    }
-    workerMain(&workers[0]);
-    for (threads) |t| t.join();
 }
 
 fn workerMain(w: *Worker) void {
-    // Each worker submits its own accept_multishot on the shared listen_fd.
-    // Kernel distributes accepts across rings.
+    // accept_multishot no data socket (fallback / smoke).
     _ = w.ring.accept_multishot(encodeUd(.accept, 0), w.listen_fd, null, null, 0) catch |err| {
-        std.log.err("worker {d}: accept_multishot init: {}", .{ w.id, err });
+        std.log.err("worker: accept_multishot init: {}", .{err});
         return;
     };
+    // read no eventfd para acordar quando a control thread sinalizar.
+    submitEventfdRead(w);
 
     var cqes: [128]linux.io_uring_cqe = undefined;
     while (true) {
@@ -149,6 +225,10 @@ fn workerMain(w: *Worker) void {
         const n = w.ring.copy_cqes(&cqes, 0) catch continue;
         for (cqes[0..n]) |cqe| handleCqe(w, cqe);
     }
+}
+
+fn submitEventfdRead(w: *Worker) void {
+    _ = w.ring.read(encodeUd(.eventfd_read, 0), w.event_fd, .{ .buffer = &w.event_buf }, 0) catch {};
 }
 
 fn handleCqe(w: *Worker, cqe: linux.io_uring_cqe) void {
@@ -159,7 +239,34 @@ fn handleCqe(w: *Worker, cqe: linux.io_uring_cqe) void {
         .read => handleRead(w, idx, cqe),
         .write => handleWrite(w, idx, cqe),
         .close => w.release(idx),
+        .eventfd_read => handleEventfdRead(w, cqe),
     }
+}
+
+fn handleEventfdRead(w: *Worker, cqe: linux.io_uring_cqe) void {
+    // Re-arma o eventfd read antes de drenar (evita perder notificacoes durante o drain).
+    submitEventfdRead(w);
+    if (cqe.res < 0) return;
+
+    // Drena ate 64 FDs por wake-up (limita stalls do worker loop).
+    var batch: [64]i32 = undefined;
+    while (true) {
+        const n = w.queue.drain(&batch);
+        if (n == 0) return;
+        for (batch[0..n]) |fd| acceptFromQueue(w, fd);
+    }
+}
+
+fn acceptFromQueue(w: *Worker, fd: i32) void {
+    const conn_idx = w.alloc() orelse {
+        _ = w.ring.close(encodeUd(.close, 0), fd) catch {};
+        return;
+    };
+    const conn = &w.conns[conn_idx];
+    conn.fd = fd;
+    conn.fill = 0;
+    conn.closing = false;
+    submitRead(w, conn_idx);
 }
 
 fn handleAccept(w: *Worker, cqe: linux.io_uring_cqe) void {
@@ -171,16 +278,7 @@ fn handleAccept(w: *Worker, cqe: linux.io_uring_cqe) void {
     if ((cqe.flags & linux.IORING_CQE_F_MORE) == 0) {
         _ = w.ring.accept_multishot(encodeUd(.accept, 0), w.listen_fd, null, null, 0) catch {};
     }
-
-    const conn_idx = w.alloc() orelse {
-        _ = w.ring.close(encodeUd(.close, 0), fd) catch {};
-        return;
-    };
-    const conn = &w.conns[conn_idx];
-    conn.fd = fd;
-    conn.fill = 0;
-    conn.closing = false;
-    submitRead(w, conn_idx);
+    acceptFromQueue(w, fd);
 }
 
 fn submitRead(w: *Worker, idx: u32) void {
